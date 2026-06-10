@@ -2,6 +2,11 @@ import streamlit as st
 import os, json, subprocess, requests, re, asyncio
 import time as time_module
 import edge_tts
+from app.services import task as tm
+from app.models.schema import VideoParams
+from app.services import state as sm
+from app.models import const
+from app.utils import utils
 
 # ── Colab / Jupyter / Streamlit async compatibility ──────────────────────────
 try:
@@ -1244,118 +1249,49 @@ if page == "🎬  Generate Video":
 
                         gen_start = st.session_state.get("gen_start", time_module.time())
 
-                        # ── Step 1 — Script ──────────────────────────────────
-                        if st.session_state["gen_step"] < 1:
-                            _s = time_module.time()
-                            stat.info("📝 Step 1/4 — Script generate ho rahi hai...")
-                            timer.caption(
-                                f"⏱️ Elapsed: {_fmt_time(time_module.time()-gen_start)}"
-                                f"  |  Est. total: {ETA_MAP.get(video_length,'~3 min')}")
-                            if manual_script:
-                                st.session_state["gen_script"] = clean_script(manual_script)
-                            else:
-                                st.session_state["gen_script"] = generate_script_api(
-                                    video_subject, video_length, video_language, cfg)
-                            st.session_state["gen_step"] = 1
-                            st.session_state["gen_step_times"]["script"] = time_module.time()-_s
-                        prog.progress(25)
-                        _t1 = st.session_state["gen_step_times"].get("script", 0)
-                        stat.success(
-                            f"✅ Step 1 — Script ready!"
-                            f"  ({len(st.session_state['gen_script'].split())} words)"
-                            f"  · ⏱️ {_fmt_time(_t1)}")
-                        timer.caption(
-                            f"⏱️ Elapsed: {_fmt_time(time_module.time()-gen_start)}"
-                            f"  |  3 steps remaining")
+                        # Use unified service layer instead of standalone logic
+                        task_id = utils.get_uuid()
+                        params = VideoParams(
+                            video_subject=video_subject,
+                            video_script=manual_script,
+                            video_language=video_language,
+                            video_aspect="9:16" if "9:16" in video_aspect else "16:9",
+                            voice_name=selected_voice,
+                            voice_rate=voice_speed/50.0, # Normalizing to service expectation
+                            bgm_type=bg_music.lower() if bg_music != "No Music" else "",
+                            bgm_volume=bg_volume/100.0,
+                            font_size=font_size,
+                            subtitle_position=subtitle_position.lower()
+                        )
 
-                        # ── Step 2 — Voice ───────────────────────────────────
-                        if st.session_state["gen_step"] < 2:
-                            _s = time_module.time()
-                            stat.info("🎙️ Step 2/4 — Voice generate ho rahi hai...")
-                            timer.caption(
-                                f"⏱️ Elapsed: {_fmt_time(time_module.time()-gen_start)}"
-                                f"  |  2 heavy steps remaining")
-                            if tts_engine == "ElevenLabs 🎭 (Emotional)":
-                                stat.info("🎭 Step 2/4 — ElevenLabs emotional voice generate ho rahi hai...")
-                                vp, vtt = generate_voice_elevenlabs(
-                                    st.session_state["gen_script"],
-                                    el_voice_id, el_stability, el_style, cfg)
-                                if not vp:
-                                    stat.error("❌ ElevenLabs failed — Edge-TTS pe fallback...")
-                                    vp, vtt = generate_voice(
-                                        st.session_state["gen_script"],
-                                        selected_voice, voice_speed, voice_deep)
-                            else:
-                                vp, vtt = generate_voice(
-                                    st.session_state["gen_script"],
-                                    selected_voice, voice_speed, voice_deep)
-                            st.session_state["gen_voice"] = vp
-                            st.session_state["gen_vtt"]   = vtt
-                            st.session_state["gen_step"]  = 2
-                            st.session_state["gen_step_times"]["voice"] = time_module.time()-_s
-                        prog.progress(50)
-                        _t2 = st.session_state["gen_step_times"].get("voice", 0)
-                        stat.success(
-                            f"✅ Step 2 — Voice + Subtitles ready!"
-                            f"  · ⏱️ {_fmt_time(_t2)}")
-                        timer.caption(
-                            f"⏱️ Elapsed: {_fmt_time(time_module.time()-gen_start)}"
-                            f"  |  2 steps remaining")
+                        stat.info("🚀 Task start ho raha hai...")
 
-                        # ── Step 3 — Clips ───────────────────────────────────
-                        if st.session_state["gen_step"] < 3:
-                            _s = time_module.time()
-                            stat.info("🖼️ Step 3/4 — Video clips fetch ho rahe hain...")
-                            timer.caption(
-                                f"⏱️ Elapsed: {_fmt_time(time_module.time()-gen_start)}"
-                                f"  |  Compose step aane wali hai")
-                            kw = video_subject or \
-                                " ".join(st.session_state["gen_script"].split()[:4])
-                            items = fetch_pexels(
-                                kw, 6, cfg,
-                                media_type=pexels_media,
-                                vibe=video_vibe)
-                            if not items:
-                                st.warning("⚠️ Pexels media nahi mili — topic/vibe change karo!")
-                                st.stop()
-                            cdur_est = (DURATION_SECS.get(video_length,30)
-                                        / max(len(items[:6]),1))
-                            clips = [download_clip_or_photo(item, i, cdur_est)
-                                     for i, item in enumerate(items[:6])]
-                            clips = [c for c in clips if c and os.path.exists(c)]
-                            st.session_state["gen_clips"] = clips
-                            st.session_state["gen_step"]  = 3
-                            st.session_state["gen_step_times"]["clips"] = time_module.time()-_s
-                        prog.progress(75)
-                        _t3 = st.session_state["gen_step_times"].get("clips", 0)
-                        stat.success(
-                            f"✅ Step 3 — {len(st.session_state['gen_clips'])} clips ready!"
-                            f"  · ⏱️ {_fmt_time(_t3)}")
+                        # Background thread mein task start karein
+                        def run_task():
+                            tm.start(task_id, params)
 
-                        # ── Step 4 — Compose (longest) ───────────────────────
-                        if st.session_state["gen_step"] < 4:
-                            _s = time_module.time()
-                            _c_eta = COMPOSE_ETA.get(video_length, 150)
-                            stat.info(
-                                f"🎬 Step 4/4 — Video compose ho rahi hai..."
-                                f"  (est. {_fmt_time(_c_eta)})  ⏳ Page band mat karo!")
-                            timer.warning(
-                                f"⏱️ Elapsed: {_fmt_time(time_module.time()-gen_start)}"
-                                f"  |  🎬 Compose step — est. {_fmt_time(_c_eta)} lagega")
-                            out = compose_video(
-                                st.session_state["gen_clips"],
-                                st.session_state["gen_voice"],
-                                st.session_state["gen_vtt"],
-                                video_aspect, font_size,
-                                subtitle_color, subtitle_position,
-                                st.session_state["gen_script"],
-                                bg_music, bg_volume,
-                                max_dur_secs=DURATION_SECS.get(video_length),
-                                language=video_language)
-                            st.session_state["gen_output"] = out
-                            st.session_state["gen_step"]   = 4
-                            st.session_state["gen_step_times"]["compose"] = time_module.time()-_s
-                        prog.progress(100)
+                        import threading
+                        thread = threading.Thread(target=run_task)
+                        thread.start()
+
+                        # Monitor progress
+                        while True:
+                            task = sm.state.get_task(task_id)
+                            if task:
+                                progress = task.get("progress", 0)
+                                state = task.get("state", 0)
+                                prog.progress(int(progress))
+
+                                if state == const.TASK_STATE_COMPLETE:
+                                    st.session_state["gen_output"] = task.get("videos")[0]
+                                    st.session_state["gen_script"] = task.get("script")
+                                    break
+                                elif state == const.TASK_STATE_FAILED:
+                                    st.error("❌ Task fail ho gaya!")
+                                    break
+
+                                stat.info(f"⏳ Processing... {progress}%")
+                            time_module.sleep(1)
 
                         _total = time_module.time() - gen_start
                         _st    = st.session_state["gen_step_times"]

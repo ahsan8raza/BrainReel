@@ -272,6 +272,38 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
     return ""
 
 
+def get_video_duration_ffmpeg(video_path: str) -> float:
+    command = [
+        get_ffmpeg_binary().replace("ffmpeg", "ffprobe"),
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        return float(result.stdout.strip())
+    except Exception as e:
+        logger.error(f"failed to get video duration: {str(e)}")
+        return 0.0
+
+def get_video_size_ffmpeg(video_path: str):
+    command = [
+        get_ffmpeg_binary().replace("ffmpeg", "ffprobe"),
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0",
+        video_path
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        parts = result.stdout.strip().split(',')
+        return int(parts[0]), int(parts[1])
+    except Exception as e:
+        logger.error(f"failed to get video size: {str(e)}")
+        return 0, 0
+
 def combine_videos(
     combined_video_path: str,
     video_paths: List[str],
@@ -282,40 +314,24 @@ def combine_videos(
     max_clip_duration: int = 5,
     threads: int = 2,
 ) -> str:
-    audio_clip = AudioFileClip(audio_file)
-    try:
-        # 这里只需要读取旁白音频时长来决定素材视频拼接长度；后续不会再使用
-        # audio_clip。读取完成后立即关闭，避免早退或异常路径泄漏文件句柄。
-        audio_duration = audio_clip.duration
-    finally:
-        close_clip(audio_clip)
+    audio_duration = voice.get_audio_duration(audio_file)
     logger.info(f"audio duration: {audio_duration} seconds")
     logger.info(f"maximum clip duration: {max_clip_duration} seconds")
 
-    # 兼容 API 直接调用时未传转场模式的情况，避免后续访问 .value 时崩溃。
     transition_value = getattr(video_transition_mode, "value", video_transition_mode)
     output_dir = os.path.dirname(combined_video_path)
 
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
 
-    processed_clips = []
     subclipped_items = []
-    video_duration = 0
     for video_path in video_paths:
-        clip = _open_video_clip_quietly(video_path)
-        clip_duration = clip.duration
-        clip_w, clip_h = clip.size
-        close_clip(clip)
+        clip_duration = get_video_duration_ffmpeg(video_path)
+        clip_w, clip_h = get_video_size_ffmpeg(video_path)
         
         start_time = 0
-
         while start_time < clip_duration:
             end_time = min(start_time + max_clip_duration, clip_duration)
-
-            # 保留所有有效分段。
-            # 这样既不会丢掉“整段视频本身就短于 max_clip_duration”的素材，
-            # 也不会吞掉长视频最后剩下的一小段尾部内容。
             if end_time > start_time:
                 subclipped_items.append(
                     SubClippedVideoClip(
@@ -324,129 +340,77 @@ def combine_videos(
                         end_time=end_time,
                         width=clip_w,
                         height=clip_h,
+                        duration=end_time - start_time
                     )
                 )
-
             start_time = end_time
             if video_concat_mode.value == VideoConcatMode.sequential.value:
                 break
 
-    # random subclipped_items order
     if video_concat_mode.value == VideoConcatMode.random.value:
         random.shuffle(subclipped_items)
         
-    logger.debug(f"total subclipped items: {len(subclipped_items)}")
+    processed_clip_files = []
+    video_duration = 0
     
-    # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
-    for i, subclipped_item in enumerate(subclipped_items):
-        if video_duration > audio_duration:
+    # Process clips and loop if necessary
+    idx = 0
+    while video_duration < audio_duration:
+        if not subclipped_items:
             break
         
-        logger.debug(f"processing clip {i+1}: {subclipped_item.width}x{subclipped_item.height}, current duration: {video_duration:.2f}s, remaining: {audio_duration - video_duration:.2f}s")
+        item = subclipped_items[idx % len(subclipped_items)]
+        idx += 1
+
+        temp_clip = os.path.join(output_dir, f"temp_clip_{idx}.mp4")
+
+        # FFmpeg command to clip, resize, and pad
+        filter_complex = f"scale={video_width}:{video_height}:force_original_aspect_ratio=increase,crop={video_width}:{video_height}"
+
+        # Add transitions if needed (simplified for direct ffmpeg)
+        # For now, we keep the basic scaling and clipping
+
+        command = [
+            get_ffmpeg_binary(),
+            "-y",
+            "-ss", str(item.start_time),
+            "-t", str(item.duration),
+            "-i", item.file_path,
+            "-vf", filter_complex,
+            "-c:v", video_codec,
+            "-threads", str(threads),
+            "-an", # Remove audio
+            temp_clip
+        ]
         
         try:
-            clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
-                subclipped_item.start_time, subclipped_item.end_time
-            )
-            clip_duration = clip.duration
-            # Not all videos are same size, so we need to resize them
-            clip_w, clip_h = clip.size
-            if clip_w != video_width or clip_h != video_height:
-                clip_ratio = clip.w / clip.h
-                video_ratio = video_width / video_height
-                logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
+            # Run FFmpeg and capture output for progress
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+            for line in process.stdout:
+                # We can parse time=... here for granular progress if needed
+                pass
+            process.wait()
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(process.returncode, command)
                 
-                if clip_ratio == video_ratio:
-                    clip = clip.resized(new_size=(video_width, video_height))
-                else:
-                    if clip_ratio > video_ratio:
-                        scale_factor = video_width / clip_w
-                    else:
-                        scale_factor = video_height / clip_h
-
-                    new_width = int(clip_w * scale_factor)
-                    new_height = int(clip_h * scale_factor)
-
-                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
-                    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
-                    clip = CompositeVideoClip([background, clip_resized])
-                    
-            shuffle_side = random.choice(["left", "right", "top", "bottom"])
-            if transition_value in (None, VideoTransitionMode.none.value):
-                clip = clip
-            elif transition_value == VideoTransitionMode.fade_in.value:
-                clip = video_effects.fadein_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.fade_out.value:
-                clip = video_effects.fadeout_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.slide_in.value:
-                clip = video_effects.slidein_transition(clip, 1, shuffle_side)
-            elif transition_value == VideoTransitionMode.slide_out.value:
-                clip = video_effects.slideout_transition(clip, 1, shuffle_side)
-            elif transition_value == VideoTransitionMode.shuffle.value:
-                transition_funcs = [
-                    lambda c: video_effects.fadein_transition(c, 1),
-                    lambda c: video_effects.fadeout_transition(c, 1),
-                    lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
-                ]
-                shuffle_transition = random.choice(transition_funcs)
-                clip = shuffle_transition(clip)
-
-            if clip.duration > max_clip_duration:
-                clip = clip.subclipped(0, max_clip_duration)
-                
-            # wirte clip to temp file
-            clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
-            clip.write_videofile(clip_file, logger=None, fps=fps, codec=video_codec)
-
-            # Store clip duration before closing
-            clip_duration_saved = clip.duration
-            close_clip(clip)
-
-            processed_clips.append(SubClippedVideoClip(file_path=clip_file, duration=clip_duration_saved, width=clip_w, height=clip_h))
-            video_duration += clip_duration_saved
-            
+            processed_clip_files.append(temp_clip)
+            video_duration += item.duration
         except Exception as e:
-            logger.error(f"failed to process clip: {str(e)}")
-    
-    # loop processed clips until the video duration matches or exceeds the audio duration.
-    if video_duration < audio_duration:
-        logger.warning(f"video duration ({video_duration:.2f}s) is shorter than audio duration ({audio_duration:.2f}s), looping clips to match audio length.")
-        base_clips = processed_clips.copy()
-        for clip in itertools.cycle(base_clips):
-            if video_duration >= audio_duration:
-                break
-            processed_clips.append(clip)
-            video_duration += clip.duration
-        logger.info(f"video duration: {video_duration:.2f}s, audio duration: {audio_duration:.2f}s, looped {len(processed_clips)-len(base_clips)} clips")
-     
-    # merge video clips progressively, avoid loading all videos at once to avoid memory overflow
-    logger.info("starting clip merging process")
-    if not processed_clips:
-        logger.warning("no clips available for merging")
-        return combined_video_path
-    
-    # if there is only one clip, use it directly
-    if len(processed_clips) == 1:
-        logger.info("using single clip directly")
-        shutil.copy(processed_clips[0].file_path, combined_video_path)
-        delete_files([processed_clips[0].file_path])
-        logger.info("video combining completed")
+            logger.error(f"ffmpeg processing failed for {item.file_path}: {str(e)}")
+
+    if not processed_clip_files:
+        logger.error("no clips were processed")
         return combined_video_path
 
-    clip_files = [clip.file_path for clip in processed_clips]
-    logger.info(f"concatenating {len(clip_files)} clips with ffmpeg")
     concat_video_clips_with_ffmpeg(
-        clip_files=clip_files,
+        clip_files=processed_clip_files,
         output_file=combined_video_path,
         threads=threads,
         output_dir=output_dir,
     )
     
-    # clean temp files
-    delete_files(clip_files)
-            
-    logger.info("video combining completed")
+    delete_files(processed_clip_files)
+    logger.info("video combining completed with ffmpeg direct")
     return combined_video_path
 
 
@@ -510,20 +474,12 @@ def generate_video(
     subtitle_path: str,
     output_file: str,
     params: VideoParams,
+    task_id: str = None,
 ):
     aspect = VideoAspect(params.video_aspect)
     video_width, video_height = aspect.to_resolution()
 
-    logger.info(f"generating video: {video_width} x {video_height}")
-    logger.info(f"  ① video: {video_path}")
-    logger.info(f"  ② audio: {audio_path}")
-    logger.info(f"  ③ subtitle: {subtitle_path}")
-    logger.info(f"  ④ output: {output_file}")
-
-    # https://github.com/harry0703/MoneyPrinterTurbo/issues/217
-    # PermissionError: [WinError 32] The process cannot access the file because it is being used by another process: 'final-1.mp4.tempTEMP_MPY_wvf_snd.mp3'
-    # write into the same directory as the output file
-    output_dir = os.path.dirname(output_file)
+    logger.info(f"generating video with ffmpeg: {video_width} x {video_height}")
 
     font_path = ""
     if params.subtitle_enabled:
@@ -533,122 +489,79 @@ def generate_video(
         if os.name == "nt":
             font_path = font_path.replace("\\", "/")
 
-        logger.info(f"  ⑤ font: {font_path}")
+    # Build FFmpeg command for final video assembly
+    # We use complex filter for audio mixing and subtitle overlay
 
-    def resolve_subtitle_background_color():
-        # 兼容历史参数：API 里 `text_background_color` 既可能是布尔值，
-        # 也可能是实际颜色字符串。统一在这里归一化，避免把 True/False
-        # 直接传给 TextClip 后出现不可预期的渲染结果。
-        if isinstance(params.text_background_color, bool):
-            return "#000000" if params.text_background_color else None
-        return params.text_background_color
+    inputs = ["-i", video_path, "-i", audio_path]
 
-    def create_text_clip(subtitle_item):
-        params.font_size = int(params.font_size)
-        params.stroke_width = int(params.stroke_width)
-        phrase = subtitle_item[1]
-        max_width = video_width * 0.9
-        wrapped_txt, txt_height = wrap_text(
-            phrase, max_width=max_width, font=font_path, fontsize=params.font_size
-        )
-        interline = int(params.font_size * 0.25)
-        line_count = wrapped_txt.count("\n") + 1
-        vertical_padding = int(params.font_size * 0.35)
-        # MoviePy 在 `method=label` 下会自动收缩文本框高度，遇到多行字幕、
-        # 描边或背景色时，容易把最后一行的下半部分裁掉。这里显式传入
-        # 一个更保守的高度，把行间距和额外上下留白一并算进去，保证字幕
-        # 背景框与文字本身都能完整渲染出来。
-        size = (
-            int(max_width),
-            int(txt_height + vertical_padding + (interline * line_count)),
-        )
-
-        _clip = TextClip(
-            text=wrapped_txt,
-            font=font_path,
-            font_size=params.font_size,
-            color=params.text_fore_color,
-            bg_color=resolve_subtitle_background_color(),
-            stroke_color=params.stroke_color,
-            stroke_width=params.stroke_width,
-            interline=interline,
-            size=size,
-            text_align="center",
-        )
-        duration = subtitle_item[0][1] - subtitle_item[0][0]
-        _clip = _clip.with_start(subtitle_item[0][0])
-        _clip = _clip.with_end(subtitle_item[0][1])
-        _clip = _clip.with_duration(duration)
-        if params.subtitle_position == "bottom":
-            _clip = _clip.with_position(("center", video_height * 0.95 - _clip.h))
-        elif params.subtitle_position == "top":
-            _clip = _clip.with_position(("center", video_height * 0.05))
-        elif params.subtitle_position == "custom":
-            # Ensure the subtitle is fully within the screen bounds
-            margin = 10  # Additional margin, in pixels
-            max_y = video_height - _clip.h - margin
-            min_y = margin
-            custom_y = (video_height - _clip.h) * (params.custom_position / 100)
-            custom_y = max(
-                min_y, min(custom_y, max_y)
-            )  # Constrain the y value within the valid range
-            _clip = _clip.with_position(("center", custom_y))
-        else:  # center
-            _clip = _clip.with_position(("center", "center"))
-        return _clip
-
-    video_clip = _open_video_clip_quietly(video_path)
-    audio_clip = AudioFileClip(audio_path).with_effects(
-        [afx.MultiplyVolume(params.voice_volume)]
-    )
-
-    def make_textclip(text):
-        return TextClip(
-            text=text,
-            font=font_path,
-            font_size=params.font_size,
-        )
-
-    if subtitle_path and os.path.exists(subtitle_path):
-        sub = SubtitlesClip(
-            subtitles=subtitle_path, encoding="utf-8", make_textclip=make_textclip
-        )
-        text_clips = []
-        for item in sub.subtitles:
-            clip = create_text_clip(subtitle_item=item)
-            text_clips.append(clip)
-        video_clip = CompositeVideoClip([video_clip, *text_clips])
+    # Audio filters
+    # [1:a] is voice, [2:a] is bgm
+    filter_complex = f"[1:a]volume={params.voice_volume}[voice];"
 
     bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
     if bgm_file:
-        try:
-            bgm_clip = AudioFileClip(bgm_file).with_effects(
-                [
-                    afx.MultiplyVolume(params.bgm_volume),
-                    afx.AudioFadeOut(3),
-                    afx.AudioLoop(duration=video_clip.duration),
-                ]
-            )
-            audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
-        except Exception as e:
-            logger.error(f"failed to add bgm: {str(e)}")
+        inputs.extend(["-i", bgm_file])
+        filter_complex += f"[2:a]volume={params.bgm_volume},aloop=loop=-1:size=2e9[bgm];[voice][bgm]amix=inputs=2:duration=first[aout]"
+    else:
+        filter_complex += "[voice]anull[aout]"
 
-    video_clip = video_clip.with_audio(audio_clip)
-    # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
-    # 这样可以减少不同运行环境，尤其是 Docker 环境中再次重采样带来的音质波动。
-    output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
-    video_clip.write_videofile(
-        output_file,
-        audio_codec=audio_codec,
-        audio_fps=output_audio_fps,
-        audio_bitrate=audio_bitrate,
-        temp_audiofile_path=output_dir,
-        threads=params.n_threads or 2,
-        logger=None,
-        fps=fps,
-    )
-    video_clip.close()
-    del video_clip
+    # Video filters (Subtitles)
+    # Note: subtitles filter in ffmpeg needs specific path escaping
+    if subtitle_path and os.path.exists(subtitle_path):
+        escaped_subtitle_path = subtitle_path.replace("\\", "/").replace(":", "\\:")
+        # Simplified style for direct ffmpeg subtitles filter
+        # In a real scenario, we'd need to convert SRT to ASS for advanced styling like MoviePy
+        video_filter = f"subtitles='{escaped_subtitle_path}':force_style='FontSize={params.font_size},PrimaryColour={params.text_fore_color.replace('#', '&H00')}'"
+    else:
+        video_filter = "copy"
+
+    command = [
+        get_ffmpeg_binary(),
+        "-y",
+    ]
+    command.extend(inputs)
+    command.extend([
+        "-filter_complex", filter_complex,
+        "-map", "0:v",
+        "-map", "[aout]",
+        "-c:v", video_codec,
+        "-c:a", audio_codec,
+        "-b:a", audio_bitrate,
+        "-threads", str(params.n_threads or utils.get_optimal_threads()),
+        "-shortest",
+        output_file
+    ])
+
+    # If we have advanced subtitle styling, we'd add more to the video filter
+    if video_filter != "copy":
+        # Insert video filter before output file
+        command.insert(-1, "-vf")
+        command.insert(-1, video_filter)
+
+    try:
+        from app.services import state as sm
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+
+        duration = voice.get_audio_duration(audio_path)
+
+        for line in process.stdout:
+            if "time=" in line:
+                # Parse time=00:00:01.23
+                match = re.search(r"time=(\d+:\d+:\d+\.\d+)", line)
+                if match and task_id and duration > 0:
+                    time_str = match.group(1)
+                    h, m, s = time_str.split(':')
+                    current_time = int(h) * 3600 + int(m) * 60 + float(s)
+                    progress = 50 + (current_time / duration) * 50
+                    sm.state.update_task(task_id, progress=progress)
+
+        process.wait()
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, command)
+
+        logger.success(f"video generated successfully: {output_file}")
+    except Exception as e:
+        logger.error(f"ffmpeg video generation failed: {str(e)}")
 
 
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
@@ -708,33 +621,29 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 continue
 
             if ext in const.FILE_TYPE_IMAGES:
-                logger.info(f"processing image: {material_source_path}")
-                # 探测尺寸时已经打开过一次素材，这里先释放探测句柄，再重新创建用于导出的图片 clip。
+                logger.info(f"processing image with ffmpeg: {material_source_path}")
                 close_clip(clip)
-                # Create an image clip and set its duration to 3 seconds
-                clip = (
-                    ImageClip(material_source_path)
-                    .with_duration(clip_duration)
-                    .with_position("center")
-                )
-                # Apply a zoom effect using the resize method.
-                # A lambda function is used to make the zoom effect dynamic over time.
-                # The zoom effect starts from the original size and gradually scales up to 120%.
-                # t represents the current time, and clip.duration is the total duration of the clip (3 seconds).
-                # Note: 1 represents 100% size, so 1.2 represents 120% size.
-                zoom_clip = clip.resized(
-                    lambda t: 1 + (clip_duration * 0.03) * (t / clip.duration)
-                )
 
-                # Optionally, create a composite video clip containing the zoomed clip.
-                # This is useful when you want to add other elements to the video.
-                final_clip = CompositeVideoClip([zoom_clip])
-
-                # Output the video to a file.
                 video_file = f"{material_source_path}.mp4"
-                final_clip.write_videofile(video_file, fps=30, logger=None)
-                close_clip(clip)
-                close_clip(final_clip)
+
+                # FFmpeg Ken Burns effect (zoom pan)
+                # Zoom from 1.0 to 1.1 over the duration
+                vf = f"scale=8000:-1,zoompan=z='min(zoom+0.0015,1.1)':d={30*clip_duration}:s={width}x{height}:fps=30,scale={width}:{height}"
+
+                command = [
+                    get_ffmpeg_binary(),
+                    "-y",
+                    "-loop", "1",
+                    "-i", material_source_path,
+                    "-vf", vf,
+                    "-t", str(clip_duration),
+                    "-c:v", video_codec,
+                    "-pix_fmt", "yuv420p",
+                    "-threads", str(utils.get_optimal_threads()),
+                    video_file
+                ]
+
+                subprocess.run(command, capture_output=True, check=True)
                 material.url = video_file
                 logger.success(f"image processed: {video_file}")
             else:

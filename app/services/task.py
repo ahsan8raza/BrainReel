@@ -37,8 +37,9 @@ def generate_terms(task_id, params, video_script):
     logger.info("\n\n## generating video terms")
     video_terms = params.video_terms
     if not video_terms:
-        video_terms = llm.generate_terms(
-            video_subject=params.video_subject, video_script=video_script, amount=5
+        # Smart material selection: generate visual cues instead of just terms
+        video_terms = llm.generate_visual_cues(
+            video_subject=params.video_subject, video_script=video_script, amount=10
         )
     else:
         if isinstance(video_terms, str):
@@ -203,6 +204,7 @@ def generate_final_videos(
         params.video_concat_mode if params.video_count == 1 else VideoConcatMode.random
     )
     video_transition_mode = params.video_transition_mode
+    threads = params.n_threads or utils.get_optimal_threads()
 
     _progress = 50
     for i in range(params.video_count):
@@ -219,7 +221,7 @@ def generate_final_videos(
             video_concat_mode=video_concat_mode,
             video_transition_mode=video_transition_mode,
             max_clip_duration=params.video_clip_duration,
-            threads=params.n_threads,
+            threads=threads,
         )
 
         _progress += 50 / params.video_count / 2
@@ -234,6 +236,7 @@ def generate_final_videos(
             subtitle_path=subtitle_path,
             output_file=final_video_path,
             params=params,
+            task_id=task_id,
         )
 
         _progress += 50 / params.video_count / 2

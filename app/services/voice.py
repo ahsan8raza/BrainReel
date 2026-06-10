@@ -1151,6 +1151,11 @@ def is_gemini_voice(voice_name: str):
     return voice_name.startswith("gemini:")
 
 
+def is_elevenlabs_voice(voice_name: str):
+    """Check if it is an ElevenLabs voice"""
+    return voice_name.startswith("elevenlabs:") or voice_name.startswith("EL:")
+
+
 def tts(
     text: str,
     voice_name: str,
@@ -1160,6 +1165,10 @@ def tts(
 ) -> Union[SubMaker, None]:
     if is_azure_v2_voice(voice_name):
         return azure_tts_v2(text, voice_name, voice_file)
+    elif is_elevenlabs_voice(voice_name):
+        # Extract voice_id from elevenlabs:voice_id
+        voice_id = voice_name.split(":")[-1]
+        return elevenlabs_tts(text, voice_id, voice_file)
     elif is_siliconflow_voice(voice_name):
         # 从voice_name中提取模型和声音
         # 格式: siliconflow:model:voice-Gender
@@ -1748,6 +1757,96 @@ def azure_tts_v2(text: str, voice_name: str, voice_file: str) -> Union[SubMaker,
         except Exception as e:
             logger.error(f"failed, error: {str(e)}")
     return None
+
+
+def elevenlabs_tts(text: str, voice_id: str, voice_file: str) -> Union[SubMaker, None]:
+    """
+    Generate speech using ElevenLabs API with word-level timestamps.
+    """
+    import base64
+    api_key = config.app.get("elevenlabs_api_key", "")
+    if not api_key:
+        logger.error("ElevenLabs API key is not set")
+        return None
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
+    headers = {
+        "xi-api-key": api_key,
+        "Content-Type": "application/json"
+    }
+    data = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.75,
+            "style": 0.0,
+            "use_speaker_boost": True
+        }
+    }
+
+    try:
+        response = requests.post(url, json=data, headers=headers, timeout=90)
+        if response.status_code != 200:
+            logger.error(f"ElevenLabs TTS failed: {response.status_code} - {response.text}")
+            return None
+
+        result = response.json()
+        audio_base64 = result.get("audio_base64", "")
+        if not audio_base64:
+            return None
+
+        audio_bytes = base64.b64decode(audio_base64)
+        with open(voice_file, "wb") as f:
+            f.write(audio_bytes)
+
+        sub_maker = ensure_legacy_submaker_fields(SubMaker())
+
+        # Alignment data for subtitles
+        alignment = result.get("alignment", {})
+        chars = alignment.get("characters", [])
+        starts = alignment.get("character_start_times_seconds", [])
+        ends = alignment.get("character_end_times_seconds", [])
+
+        if chars and starts and ends:
+            # Group characters into words
+            words = []
+            current_word = ""
+            word_start = None
+
+            for i, char in enumerate(chars):
+                if char.isspace() or char in const.PUNCTUATIONS:
+                    if current_word:
+                        words.append({
+                            "text": current_word,
+                            "start": word_start,
+                            "end": ends[i-1]
+                        })
+                        current_word = ""
+                        word_start = None
+                else:
+                    if not current_word:
+                        word_start = starts[i]
+                    current_word += char
+
+            if current_word:
+                words.append({
+                    "text": current_word,
+                    "start": word_start,
+                    "end": ends[-1]
+                })
+
+            for word in words:
+                sub_maker.subs.append(word["text"])
+                # Convert to 100-nanosecond ticks
+                sub_maker.offset.append((int(word["start"] * 1e7), int(word["end"] * 1e7)))
+
+        logger.success(f"ElevenLabs TTS succeeded: {voice_file}")
+        return sub_maker
+
+    except Exception as e:
+        logger.error(f"ElevenLabs TTS failed: {str(e)}")
+        return None
 
 
 def gemini_tts(
