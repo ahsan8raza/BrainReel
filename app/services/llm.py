@@ -94,12 +94,14 @@ def _generate_response(prompt: str) -> str:
                 model_name = config.app.get("moonshot_model_name")
                 base_url = "https://api.moonshot.cn/v1"
             elif llm_provider == "ollama":
-                # api_key = config.app.get("openai_api_key")
-                api_key = "ollama"  # any string works but you are required to have one
+                api_key = "ollama"
                 model_name = config.app.get("ollama_model_name")
-                base_url = config.app.get("ollama_base_url", "")
+                base_url = config.app.get("ollama_base_url", "").strip()
                 if not base_url:
                     base_url = "http://localhost:11434/v1"
+                # Ensure base_url ends with /v1 if using OpenAI client
+                if not base_url.endswith("/v1") and not base_url.endswith("/v1/"):
+                    base_url = base_url.rstrip("/") + "/v1"
             elif llm_provider == "openai":
                 api_key = config.app.get("openai_api_key")
                 model_name = config.app.get("openai_model_name")
@@ -596,6 +598,57 @@ Please note that you must use English for generating video search terms; Chinese
 
     logger.success(f"completed: \n{search_terms}")
     return search_terms
+
+
+def generate_visual_cues(video_subject: str, video_script: str, amount: int = 10) -> List[str]:
+    prompt = f"""
+# Role: Visual Material Expert
+
+## Goals:
+Analyze the video script and suggest {amount} specific visual descriptions (search terms) for each scene or paragraph.
+These terms will be used to search for royalty-free stock videos.
+
+## Constrains:
+1. Return a JSON array of strings.
+2. Each string should be a concise, descriptive English search term (2-5 words).
+3. Focus on visual actions, settings, and objects.
+4. You must only return the JSON array, nothing else.
+
+## Context:
+### Video Subject:
+{video_subject}
+
+### Video Script:
+{video_script}
+
+## Output Example:
+["man walking in forest", "tranquil mountain lake", "close up of hands typing", "busy city street at night"]
+""".strip()
+
+    logger.info(f"generating visual cues for subject: {video_subject}")
+
+    visual_cues = []
+    for i in range(_max_retries):
+        try:
+            response = _generate_response(prompt)
+            # Find the first '[' and last ']' to extract JSON if LLM added extra text
+            start_idx = response.find('[')
+            end_idx = response.rfind(']') + 1
+            if start_idx != -1 and end_idx != 0:
+                json_str = response[start_idx:end_idx]
+                visual_cues = json.loads(json_str)
+
+            if isinstance(visual_cues, list) and len(visual_cues) > 0:
+                break
+        except Exception as e:
+            logger.warning(f"failed to generate visual cues: {str(e)}")
+
+    if not visual_cues:
+        # Fallback to standard terms if cues generation fails
+        return generate_terms(video_subject, video_script, amount)
+
+    logger.success(f"visual cues generated: {visual_cues}")
+    return visual_cues
 
 
 if __name__ == "__main__":
