@@ -533,7 +533,7 @@ def download_clip(url, idx):
     return path
 
 def compose_video(clips, voice_path, vtt_path, aspect,
-                  font_size, color, position, script, bg_style, bg_vol, max_dur_secs=None, language="English"):
+                  font_size, color, position, script, bg_style, bg_vol, max_dur_secs=None, language="English", show_subtitles=True):
     out = "/tmp/final.mp4"
     W,H = (1080,1920) if "9:16" in aspect else (1920,1080)
     # ── B2 FIX: enforce user-selected duration cap ───────────────────────────
@@ -601,14 +601,16 @@ def compose_video(clips, voice_path, vtt_path, aspect,
                "-t",str(dur),
                "-filter_complex",
                "[1:a]volume=1.0[va];[2:a]volume=0.5[ba];[va][ba]amix=inputs=2:duration=first:normalize=0[aout]",
-               "-map","0:v","-map","[aout]",
-               "-vf",sub_f,
-               "-c:v","libx264","-preset","ultrafast","-c:a","aac",out]
+               "-map","0:v","-map","[aout]"]
+        if show_subtitles:
+            cmd += ["-vf", sub_f]
+        cmd += ["-c:v","libx264","-preset","ultrafast","-c:a","aac",out]
     else:
         cmd = ["ffmpeg","-y","-i",cout,"-i",voice_path,
-               "-t",str(dur),"-map","0:v","-map","1:a",
-               "-vf",sub_f,
-               "-c:v","libx264","-preset","ultrafast","-c:a","aac",out]
+               "-t",str(dur),"-map","0:v","-map","1:a"]
+        if show_subtitles:
+            cmd += ["-vf", sub_f]
+        cmd += ["-c:v","libx264","-preset","ultrafast","-c:a","aac",out]
 
     subprocess.run(cmd, capture_output=True)
 
@@ -1042,13 +1044,14 @@ if page == "🎬  Generate Video":
         _media_map = {"🎬 Video":"video","📷 Photo":"photo","🎞️ Mixed":"both"}
         pexels_media = _media_map.get(media_type_opt, "video")
         st.markdown("**Subtitle Settings**")
+        show_subtitles = st.toggle("Show Subtitles", value=False)
         col3, col4 = st.columns(2)
         with col3:
-            font_size = st.slider("Font Size", 20, 80, 42)
+            font_size = st.slider("Font Size", 20, 80, 42, disabled=not show_subtitles)
         with col4:
             subtitle_position = st.selectbox("Position",
-                ["Bottom","Center","Top"])
-        subtitle_color = st.color_picker("Subtitle Color","#FFFFFF")
+                ["Bottom","Center","Top"], disabled=not show_subtitles)
+        subtitle_color = st.color_picker("Subtitle Color","#FFFFFF", disabled=not show_subtitles)
 
     with tab3:
         st.markdown('<div class="card-title">🔊 Voice & Music</div>',
@@ -1351,7 +1354,8 @@ if page == "🎬  Generate Video":
                                 st.session_state["gen_script"],
                                 bg_music, bg_volume,
                                 max_dur_secs=DURATION_SECS.get(video_length),
-                                language=video_language)
+                                language=video_language,
+                                show_subtitles=show_subtitles)
                             st.session_state["gen_output"] = out
                             st.session_state["gen_step"]   = 4
                             st.session_state["gen_step_times"]["compose"] = time_module.time()-_s
